@@ -399,6 +399,7 @@ def main() -> None:
     dataset_iter = iter(dataset["train"])
     progress_bar = None
     last_written = existing_rows
+    skipped_errors = 0
     if tqdm is not None:
         progress_bar = tqdm(
             total=max_samples,
@@ -496,8 +497,11 @@ def main() -> None:
             index, text_en, text_ja, error = pool.results.get()
             in_flight -= 1
             if error is not None:
-                raise error
-            pending[index] = (text_en, text_ja)
+                skipped_errors += 1
+                print(f"skip index={index} error={error}")
+                pending[index] = ("", "")
+            else:
+                pending[index] = (text_en, text_ja)
     finally:
         pool.close()
 
