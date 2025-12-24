@@ -164,9 +164,13 @@ class ParquetShardWriter:
         self.written_rows = start_written
         os.makedirs(self.output_dir, exist_ok=True)
 
-    def _flush_buffer(self) -> None:
+    @property
+    def buffered_rows(self) -> int:
+        return len(self._buffer_en)
+
+    def _flush_buffer(self) -> int:
         if not self._buffer_en:
-            return
+            return 0
         output_path = os.path.join(
             self.output_dir,
             f"c4-train-ja-{self.shard_id:05d}.parquet",
@@ -176,21 +180,24 @@ class ParquetShardWriter:
             schema=self._schema,
         )
         pq.write_table(table, output_path, compression="zstd")
-        self.written_rows += len(self._buffer_en)
+        flushed_rows = len(self._buffer_en)
+        self.written_rows += flushed_rows
         self.shard_id += 1
         self._buffer_en = []
         self._buffer_ja = []
+        return flushed_rows
 
-    def add(self, text_en: str | None, text_ja: str | None) -> None:
+    def add(self, text_en: str | None, text_ja: str | None) -> int:
         text_en = _normalize_text(text_en)
         text_ja = _normalize_text(text_ja)
         self._buffer_en.append(text_en)
         self._buffer_ja.append(text_ja)
         if len(self._buffer_en) >= self.flush_every_rows:
-            self._flush_buffer()
+            return self._flush_buffer()
+        return 0
 
-    def flush(self) -> None:
-        self._flush_buffer()
+    def flush(self) -> int:
+        return self._flush_buffer()
 
 
 def _find_next_shard_id(output_dir: str) -> int:
@@ -391,6 +398,7 @@ def main() -> None:
     expected_index = resume_from
     dataset_iter = iter(dataset["train"])
     progress_bar = None
+    last_written = existing_rows
     if tqdm is not None:
         progress_bar = tqdm(
             total=max_samples,
@@ -453,19 +461,22 @@ def main() -> None:
             wrote_any = False
             while expected_index in pending:
                 text_en, text_ja = pending.pop(expected_index)
-                writer.add(text_en, text_ja)
+                flushed_rows = writer.add(text_en, text_ja)
                 processed = expected_index + 1
-                _write_progress(
-                    PROGRESS_PATH,
-                    processed,
-                    writer.written_rows,
-                    writer.shard_id,
-                )
+                if flushed_rows > 0:
+                    _write_progress(
+                        PROGRESS_PATH,
+                        writer.written_rows,
+                        writer.written_rows,
+                        writer.shard_id,
+                    )
+                    last_written = writer.written_rows
                 if progress_bar is not None:
                     progress_bar.update(1)
                     progress_bar.set_postfix(
                         in_flight=in_flight,
                         pending=len(pending),
+                        buffered=writer.buffered_rows,
                     )
                 expected_index += 1
                 wrote_any = True
@@ -489,17 +500,18 @@ def main() -> None:
             pending[index] = (text_en, text_ja)
     finally:
         pool.close()
-        if progress_bar is not None:
-            progress_bar.close()
 
-    writer.flush()
-    _write_progress(
-        PROGRESS_PATH,
-        processed,
-        writer.written_rows,
-        writer.shard_id,
-    )
-    print(f"done: {processed} samples")
+    final_flushed = writer.flush()
+    if final_flushed > 0 or last_written != writer.written_rows:
+        _write_progress(
+            PROGRESS_PATH,
+            writer.written_rows,
+            writer.written_rows,
+            writer.shard_id,
+        )
+    if progress_bar is not None:
+        progress_bar.close()
+    print(f"done: {writer.written_rows} samples")
 
 
 if __name__ == "__main__":
