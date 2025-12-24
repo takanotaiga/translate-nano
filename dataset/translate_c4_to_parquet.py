@@ -1,5 +1,8 @@
+import glob
+import json
 import os
 import queue
+import subprocess
 import threading
 import time
 
@@ -7,12 +10,19 @@ from datasets import load_dataset
 from openai import OpenAI
 import pyarrow as pa
 import pyarrow.parquet as pq
+try:
+    from tqdm import tqdm
+except Exception:  # pragma: no cover - optional dependency
+    tqdm = None
 
 
 DATA_FILES = "/home/taiga/ml_lake/translate-nano-dataset/en/c4-train.*.json"
+# OUTPUT_DIR = os.path.join("/home/taiga/ml_lake/translate-nano-dataset/", "c4-ja-parquet")
 OUTPUT_DIR = os.path.join("./", "c4-ja-parquet")
-MAX_SHARD_BYTES = 300 * 1024 * 1024
-MAX_SAMPLES = 100
+MAX_SAMPLES = -1
+TARGET_IN_FLIGHT = int(os.environ.get("TARGET_IN_FLIGHT", "100"))
+WRITE_EVERY_ROWS = int(os.environ.get("WRITE_EVERY_ROWS", "1000"))
+COUNT_WORKERS = int(os.environ.get("COUNT_WORKERS", "48"))
 
 MODEL = "openai/gpt-oss-20b"
 API_KEY = os.environ.get("OPENAI_API_KEY", "dummy")
@@ -25,6 +35,7 @@ BASE_URLS = [
 if not BASE_URLS:
     BASE_URLS = [BASE_URL]
 PROGRESS_PATH = os.path.join(OUTPUT_DIR, "progress.parquet")
+SAMPLE_COUNT_PATH = os.path.join(OUTPUT_DIR, "sample_count.json")
 
 
 def _build_messages(user_input: str) -> list[dict[str, str]]:
@@ -62,12 +73,22 @@ def _build_messages(user_input: str) -> list[dict[str, str]]:
 
 
 class LLMWorkerPool:
-    def __init__(self, base_urls: list[str], api_key: str, max_retries: int = 2) -> None:
+    def __init__(
+        self,
+        base_urls: list[str],
+        api_key: str,
+        max_retries: int = 2,
+        worker_count: int | None = None,
+    ) -> None:
         self._tasks: queue.Queue[tuple[int, str, int] | None] = queue.Queue()
         self._results: queue.Queue[tuple[int, str, str, Exception | None]] = queue.Queue()
         self._threads: list[threading.Thread] = []
         self._max_retries = max_retries
-        for base_url in base_urls:
+        if not base_urls:
+            raise ValueError("base_urls must not be empty")
+        total_workers = worker_count or len(base_urls)
+        for i in range(total_workers):
+            base_url = base_urls[i % len(base_urls)]
             thread = threading.Thread(
                 target=self._worker,
                 args=(base_url, api_key),
@@ -121,54 +142,55 @@ def _normalize_text(value: str | None) -> str:
     return value if value is not None else ""
 
 
-def _estimate_bytes(text_en: str | None, text_ja: str | None) -> int:
-    text_en = _normalize_text(text_en)
-    text_ja = _normalize_text(text_ja)
-    return len(text_en.encode("utf-8")) + len(text_ja.encode("utf-8"))
-
-
 class ParquetShardWriter:
     def __init__(
         self,
         output_dir: str,
-        max_bytes: int,
+        flush_every_rows: int,
         start_shard_id: int,
         start_written: int,
     ) -> None:
         self.output_dir = output_dir
-        self.max_bytes = max_bytes
+        self.flush_every_rows = max(1, flush_every_rows)
         self.shard_id = start_shard_id
-        self.buffer_en = []
-        self.buffer_ja = []
-        self.current_bytes = 0
+        self._buffer_en: list[str] = []
+        self._buffer_ja: list[str] = []
+        self._schema = pa.schema(
+            [
+                ("text_en", pa.string()),
+                ("text_ja", pa.string()),
+            ]
+        )
         self.written_rows = start_written
         os.makedirs(self.output_dir, exist_ok=True)
 
-    def add(self, text_en: str | None, text_ja: str | None) -> bool:
-        text_en = _normalize_text(text_en)
-        text_ja = _normalize_text(text_ja)
-        self.buffer_en.append(text_en)
-        self.buffer_ja.append(text_ja)
-        self.current_bytes += _estimate_bytes(text_en, text_ja)
-        if self.current_bytes >= self.max_bytes:
-            self.flush()
-            return True
-        return False
-
-    def flush(self) -> None:
-        if not self.buffer_en:
+    def _flush_buffer(self) -> None:
+        if not self._buffer_en:
             return
-        table = pa.table({"text_en": self.buffer_en, "text_ja": self.buffer_ja})
         output_path = os.path.join(
             self.output_dir,
             f"c4-train-ja-{self.shard_id:05d}.parquet",
         )
+        table = pa.table(
+            {"text_en": self._buffer_en, "text_ja": self._buffer_ja},
+            schema=self._schema,
+        )
         pq.write_table(table, output_path, compression="zstd")
-        self.written_rows += len(self.buffer_en)
+        self.written_rows += len(self._buffer_en)
         self.shard_id += 1
-        self.buffer_en = []
-        self.buffer_ja = []
-        self.current_bytes = 0
+        self._buffer_en = []
+        self._buffer_ja = []
+
+    def add(self, text_en: str | None, text_ja: str | None) -> None:
+        text_en = _normalize_text(text_en)
+        text_ja = _normalize_text(text_ja)
+        self._buffer_en.append(text_en)
+        self._buffer_ja.append(text_ja)
+        if len(self._buffer_en) >= self.flush_every_rows:
+            self._flush_buffer()
+
+    def flush(self) -> None:
+        self._flush_buffer()
 
 
 def _find_next_shard_id(output_dir: str) -> int:
@@ -238,6 +260,94 @@ def _write_progress(
     pq.write_table(table, progress_path, compression="zstd")
 
 
+def _count_jsonl_rows_slow(paths: list[str]) -> int | None:
+    total = 0
+    for path in paths:
+        try:
+            with open(path, "rb") as handle:
+                for _ in handle:
+                    total += 1
+        except Exception as exc:
+            print(f"failed to count rows in {path}: {exc}")
+            return None
+    return total
+
+
+def _count_jsonl_rows_fast(paths: list[str]) -> int | None:
+    try:
+        result = subprocess.run(
+            ["xargs", "-P", str(COUNT_WORKERS), "-n", "1", "wc", "-l"],
+            input="\n".join(paths),
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except Exception as exc:
+        print(f"parallel wc -l failed, falling back to slow count: {exc}")
+        return _count_jsonl_rows_slow(paths)
+    total = 0
+    for line in result.stdout.splitlines():
+        parts = line.strip().split()
+        if not parts:
+            continue
+        try:
+            total += int(parts[0])
+        except ValueError:
+            continue
+    return total
+
+
+def _load_cached_sample_count(path: str, data_files_pattern: str) -> int | None:
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except Exception:
+        return None
+    if payload.get("pattern") != data_files_pattern:
+        return None
+    try:
+        return int(payload["count"])
+    except Exception:
+        return None
+
+
+def _save_cached_sample_count(path: str, data_files_pattern: str, count: int) -> None:
+    payload = {"pattern": data_files_pattern, "count": int(count)}
+    tmp_path = f"{path}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=True)
+    os.replace(tmp_path, path)
+
+
+def _count_jsonl_rows(data_files_pattern: str) -> int | None:
+    paths = sorted(glob.glob(data_files_pattern))
+    if not paths:
+        return None
+    return _count_jsonl_rows_fast(paths)
+
+
+def _resolve_max_samples(
+    dataset: object,
+    max_samples: int,
+    data_files_pattern: str,
+    sample_count_path: str,
+) -> int | None:
+    if max_samples >= 0:
+        return max_samples
+    cached = _load_cached_sample_count(sample_count_path, data_files_pattern)
+    if cached is not None:
+        return cached
+    try:
+        split_info = dataset["train"].info.splits.get("train")
+        if split_info is not None and split_info.num_examples is not None:
+            return int(split_info.num_examples)
+    except Exception:
+        pass
+    return None
+
+
 def main() -> None:
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     progress = _load_progress(PROGRESS_PATH)
@@ -251,30 +361,58 @@ def main() -> None:
     resume_from = existing_rows
     next_shard_id = _find_next_shard_id(OUTPUT_DIR)
     start_shard_id = max(progress["shard_id"], next_shard_id)
-    if resume_from >= MAX_SAMPLES:
-        print(f"done: {resume_from} samples")
-        return
-
     dataset = load_dataset(
         "json",
         data_files=DATA_FILES,
         streaming=True,
     )
+    max_samples = _resolve_max_samples(
+        dataset,
+        MAX_SAMPLES,
+        DATA_FILES,
+        SAMPLE_COUNT_PATH,
+    )
+    if max_samples is not None and resume_from >= max_samples:
+        print(f"done: {resume_from} samples")
+        return
 
     writer = ParquetShardWriter(
         OUTPUT_DIR,
-        MAX_SHARD_BYTES,
+        WRITE_EVERY_ROWS,
         start_shard_id,
         existing_rows,
     )
     processed = resume_from
-    pool = LLMWorkerPool(BASE_URLS, API_KEY)
-    max_in_flight = max(1, len(BASE_URLS) * 2)
+    max_in_flight = max(1, TARGET_IN_FLIGHT)
+    pool = LLMWorkerPool(BASE_URLS, API_KEY, worker_count=max_in_flight)
     pending: dict[int, tuple[str, str]] = {}
     in_flight = 0
     submitted = resume_from
     expected_index = resume_from
     dataset_iter = iter(dataset["train"])
+    progress_bar = None
+    if tqdm is not None:
+        progress_bar = tqdm(
+            total=max_samples,
+            initial=resume_from,
+            desc="Translating",
+            unit="samples",
+        )
+    count_queue: queue.Queue[int] | None = None
+    if max_samples is None and MAX_SAMPLES < 0:
+        count_queue = queue.Queue(maxsize=1)
+
+        def _count_worker() -> None:
+            count = _count_jsonl_rows(DATA_FILES)
+            if count is None:
+                return
+            _save_cached_sample_count(SAMPLE_COUNT_PATH, DATA_FILES, count)
+            try:
+                count_queue.put(count, block=False)
+            except Exception:
+                return
+
+        threading.Thread(target=_count_worker, daemon=True).start()
 
     try:
         skipped = 0
@@ -286,12 +424,23 @@ def main() -> None:
                 return
             skipped += 1
 
-        while expected_index < MAX_SAMPLES:
-            while submitted < MAX_SAMPLES and in_flight < max_in_flight:
+        dataset_exhausted = False
+        while True:
+            if max_samples is None and count_queue is not None:
+                try:
+                    max_samples = count_queue.get_nowait()
+                except queue.Empty:
+                    max_samples = None
+                if max_samples is not None and progress_bar is not None:
+                    progress_bar.total = max_samples
+                    progress_bar.refresh()
+            while (max_samples is None or submitted < max_samples) and in_flight < max_in_flight:
                 try:
                     sample = next(dataset_iter)
                 except StopIteration:
-                    submitted = MAX_SAMPLES
+                    dataset_exhausted = True
+                    if max_samples is not None:
+                        submitted = max_samples
                     break
                 text = sample.get("text", "")
                 if not text:
@@ -312,16 +461,25 @@ def main() -> None:
                     writer.written_rows,
                     writer.shard_id,
                 )
+                if progress_bar is not None:
+                    progress_bar.update(1)
+                    progress_bar.set_postfix(
+                        in_flight=in_flight,
+                        pending=len(pending),
+                    )
                 expected_index += 1
                 wrote_any = True
-                if processed % 10 == 0:
-                    print(f"processed {processed}/{MAX_SAMPLES}")
+                if progress_bar is None:
+                    if max_samples is None:
+                        print(f"processed {processed}")
+                    else:
+                        print(f"processed {processed}/{max_samples}")
 
-            if expected_index >= MAX_SAMPLES:
+            if max_samples is not None and expected_index >= max_samples:
                 break
             if wrote_any:
                 continue
-            if in_flight == 0 and submitted >= MAX_SAMPLES:
+            if in_flight == 0 and (dataset_exhausted or (max_samples is not None and submitted >= max_samples)):
                 break
 
             index, text_en, text_ja, error = pool.results.get()
@@ -331,6 +489,8 @@ def main() -> None:
             pending[index] = (text_en, text_ja)
     finally:
         pool.close()
+        if progress_bar is not None:
+            progress_bar.close()
 
     writer.flush()
     _write_progress(
