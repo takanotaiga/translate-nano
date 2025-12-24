@@ -1,7 +1,13 @@
 # Translate Nano
 
-## Start GPT-OSS
+## Start SDG
 
 ```bash
-CUDA_VISIBLE_DEVICES=1 uv run vllm serve openai/gpt-oss-120b --config GPT-OSS_Blackwell.yaml --port 8000
+OPENAI_BASE_URLS="http://localhost:8000/v1,http://localhost:8001/v1,http://localhost:8002/v1,http://localhost:8003/v1" \
+  python dataset/translate_c4_to_parquet.py --backend openai
+```
+
+```bash
+OPENAI_BASE_URLS="http://localhost:8000/v1,http://localhost:8001/v1,http://localhost:8002/v1,http://localhost:8003/v1" \
+  python dataset/translate_c4_to_parquet.py --backend plamo
 ```

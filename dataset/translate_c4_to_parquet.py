@@ -1,3 +1,4 @@
+import argparse
 import glob
 import json
 import os
@@ -5,6 +6,7 @@ import queue
 import subprocess
 import threading
 import time
+from typing import Sequence
 
 from datasets import load_dataset
 from openai import OpenAI
@@ -24,7 +26,12 @@ TARGET_IN_FLIGHT = int(os.environ.get("TARGET_IN_FLIGHT", "100"))
 WRITE_EVERY_ROWS = int(os.environ.get("WRITE_EVERY_ROWS", "1000"))
 COUNT_WORKERS = int(os.environ.get("COUNT_WORKERS", "48"))
 
-MODEL = "openai/gpt-oss-20b"
+OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "openai/gpt-oss-20b")
+PLAMO_MODEL = os.environ.get("PLAMO_MODEL", "pfnet/plamo-2-translate")
+OPENAI_TEMPERATURE = float(os.environ.get("OPENAI_TEMPERATURE", "0.3"))
+OPENAI_MAX_TOKENS = int(os.environ.get("OPENAI_MAX_TOKENS", "4096"))
+PLAMO_TEMPERATURE = float(os.environ.get("PLAMO_TEMPERATURE", "0"))
+PLAMO_MAX_TOKENS = int(os.environ.get("PLAMO_MAX_TOKENS", "1024"))
 API_KEY = os.environ.get("OPENAI_API_KEY", "dummy")
 BASE_URL = os.environ.get("OPENAI_BASE_URL", "http://localhost:8000/v1")
 BASE_URLS = [
@@ -72,11 +79,23 @@ def _build_messages(user_input: str) -> list[dict[str, str]]:
     ]
 
 
+def _build_plamo_prompt(user_input: str) -> str:
+    return (
+        "<|plamo:op|>dataset\n"
+        "translation\n"
+        "<|plamo:op|>input lang=English\n"
+        f"{user_input}\n"
+        "<|plamo:op|>output lang=Japanese\n"
+    )
+
+
 class LLMWorkerPool:
     def __init__(
         self,
         base_urls: list[str],
         api_key: str,
+        backend: str,
+        model: str,
         max_retries: int = 2,
         worker_count: int | None = None,
     ) -> None:
@@ -84,6 +103,10 @@ class LLMWorkerPool:
         self._results: queue.Queue[tuple[int, str, str, Exception | None]] = queue.Queue()
         self._threads: list[threading.Thread] = []
         self._max_retries = max_retries
+        if backend not in ("openai", "plamo"):
+            raise ValueError(f"unsupported backend: {backend}")
+        self._backend = backend
+        self._model = model
         if not base_urls:
             raise ValueError("base_urls must not be empty")
         total_workers = worker_count or len(base_urls)
@@ -119,14 +142,24 @@ class LLMWorkerPool:
                 break
             index, text, attempt = task
             try:
-                response = client.chat.completions.create(
-                    model=MODEL,
-                    messages=_build_messages(text),
-                    temperature=0.3,
-                    max_tokens=4096,
-                )
-                content = response.choices[0].message.content
-                translated = content if content is not None else ""
+                if self._backend == "plamo":
+                    response = client.completions.create(
+                        model=self._model,
+                        prompt=_build_plamo_prompt(text),
+                        temperature=PLAMO_TEMPERATURE,
+                        max_tokens=PLAMO_MAX_TOKENS,
+                        stop=["<|plamo:op|>"],
+                    )
+                    translated = response.choices[0].text or ""
+                else:
+                    response = client.chat.completions.create(
+                        model=self._model,
+                        messages=_build_messages(text),
+                        temperature=OPENAI_TEMPERATURE,
+                        max_tokens=OPENAI_MAX_TOKENS,
+                    )
+                    content = response.choices[0].message.content
+                    translated = content if content is not None else ""
                 self._results.put((index, text, translated, None))
             except Exception as exc:
                 if attempt < self._max_retries:
@@ -355,7 +388,31 @@ def _resolve_max_samples(
     return None
 
 
-def main() -> None:
+def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Translate C4 data to parquet.")
+    parser.add_argument(
+        "--backend",
+        choices=("openai", "plamo"),
+        default=os.environ.get("TRANSLATION_BACKEND", "openai"),
+        help="Translation backend to use.",
+    )
+    parser.add_argument(
+        "--model",
+        default=None,
+        help="Override model name for the selected backend.",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: Sequence[str] | None = None) -> None:
+    args = _parse_args(argv)
+    backend = args.backend
+    if args.model:
+        model = args.model
+    elif backend == "plamo":
+        model = PLAMO_MODEL
+    else:
+        model = OPENAI_MODEL
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     progress = _load_progress(PROGRESS_PATH)
     existing_rows = _count_existing_rows(OUTPUT_DIR)
@@ -391,7 +448,13 @@ def main() -> None:
     )
     processed = resume_from
     max_in_flight = max(1, TARGET_IN_FLIGHT)
-    pool = LLMWorkerPool(BASE_URLS, API_KEY, worker_count=max_in_flight)
+    pool = LLMWorkerPool(
+        BASE_URLS,
+        API_KEY,
+        backend=backend,
+        model=model,
+        worker_count=max_in_flight,
+    )
     pending: dict[int, tuple[str, str]] = {}
     in_flight = 0
     submitted = resume_from
