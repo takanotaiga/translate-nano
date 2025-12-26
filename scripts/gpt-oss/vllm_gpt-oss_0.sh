@@ -4,7 +4,6 @@ CUDA_VISIBLE_DEVICES=0 uv run vllm serve openai/gpt-oss-20b \
   --enable-prefix-caching \
   --gpu-memory-utilization 0.8 \
   --block-size 16 \
-  --max-model-len 32768 \
   --max-num-seqs 512 \
   --max-num-batched-tokens 256k \
   --disable-log-requests \
