@@ -19,10 +19,9 @@ except Exception:  # pragma: no cover - optional dependency
 
 
 DATA_FILES = "/home/taiga/ml_lake/translate-nano-dataset/en/c4-train.*.json"
-# OUTPUT_DIR = os.path.join("/home/taiga/ml_lake/translate-nano-dataset/", "c4-ja-parquet")
 OUTPUT_DIR = os.path.join("./", "c4-ja-parquet")
 MAX_SAMPLES = -1
-BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "10"))
+TARGET_IN_FLIGHT = int(os.environ.get("TARGET_IN_FLIGHT", "100"))
 WRITE_EVERY_ROWS = int(os.environ.get("WRITE_EVERY_ROWS", "1000"))
 COUNT_WORKERS = int(os.environ.get("COUNT_WORKERS", "48"))
 
@@ -41,36 +40,42 @@ if not BASE_URLS:
 PROGRESS_PATH = os.path.join(OUTPUT_DIR, "progress.parquet")
 SAMPLE_COUNT_PATH = os.path.join(OUTPUT_DIR, "sample_count.json")
 
-SYSTEM_PROMPT = (
-    "You are a professional translator who translates English into Japanese. "
-    "Please translate the received text directly and accurately into Japanese. "
-    "Please keep the tone of the original text. Output only the translated text. "
-    "Do not use Markdown formatting. Be sure to output the translated Japanese text."
-)
-PROMPT_EXAMPLES = [
-    (
-        "The quiet cafe buzzed with ideas as sunlight spilled across half-finished notebooks.",
-        "静かなカフェにはアイデアが満ち、差し込む日差しが書きかけのノートを照らしていた。",
-    ),
-    (
-        "She took a deep breath and stepped forward, trusting that curiosity would guide her way.",
-        "彼女は深く息を吸い、好奇心が自分を導いてくれると信じて一歩踏み出した。",
-    ),
-]
+
+def _build_messages(user_input: str) -> list[dict[str, str]]:
+    return [
+        {
+            "role": "system",
+            "content": (
+                "You are a professional translator who translates English into Japanese. "
+                "Please translate the received text directly and accurately into Japanese. "
+                "Please keep the tone of the original text. Output only the translated text. "
+                "Do not use Markdown formatting. Be sure to output the translated Japanese text."
+            ),
+        },
+        {
+            "role": "user",
+            "content": "The quiet cafe buzzed with ideas as sunlight spilled across half-finished notebooks.",
+        },
+        {
+            "role": "assistant",
+            "content": "静かなカフェにはアイデアが満ち、差し込む日差しが書きかけのノートを照らしていた。",
+        },
+        {
+            "role": "user",
+            "content": "She took a deep breath and stepped forward, trusting that curiosity would guide her way.",
+        },
+        {
+            "role": "assistant",
+            "content": "彼女は深く息を吸い、好奇心が自分を導いてくれると信じて一歩踏み出した。",
+        },
+        {
+            "role": "user",
+            "content": user_input,
+        },
+    ]
 
 
-def _build_prompt(user_input: str) -> str:
-    parts: list[str] = [SYSTEM_PROMPT, ""]
-    for text_en, text_ja in PROMPT_EXAMPLES:
-        parts.append(f"English: {text_en}")
-        parts.append(f"Japanese: {text_ja}")
-        parts.append("")
-    parts.append(f"English: {user_input}")
-    parts.append("Japanese:")
-    return "\n".join(parts)
-
-
-class LLMBatchWorkerPool:
+class LLMWorkerPool:
     def __init__(
         self,
         base_urls: list[str],
@@ -79,17 +84,13 @@ class LLMBatchWorkerPool:
         max_retries: int = 2,
         worker_count: int | None = None,
     ) -> None:
-        if not base_urls:
-            raise ValueError("base_urls must not be empty")
-        self._tasks: queue.Queue[
-            tuple[int, list[tuple[int, str]], int] | None
-        ] = queue.Queue()
-        self._results: queue.Queue[
-            tuple[int, list[tuple[int, str]], list[str], Exception | None]
-        ] = queue.Queue()
+        self._tasks: queue.Queue[tuple[int, str, int] | None] = queue.Queue()
+        self._results: queue.Queue[tuple[int, str, str, Exception | None]] = queue.Queue()
         self._threads: list[threading.Thread] = []
         self._max_retries = max_retries
         self._model = model
+        if not base_urls:
+            raise ValueError("base_urls must not be empty")
         total_workers = worker_count or len(base_urls)
         for i in range(total_workers):
             base_url = base_urls[i % len(base_urls)]
@@ -102,13 +103,11 @@ class LLMBatchWorkerPool:
             self._threads.append(thread)
 
     @property
-    def results(
-        self,
-    ) -> queue.Queue[tuple[int, list[tuple[int, str]], list[str], Exception | None]]:
+    def results(self) -> queue.Queue[tuple[int, str, str, Exception | None]]:
         return self._results
 
-    def submit(self, batch_id: int, batch: list[tuple[int, str]]) -> None:
-        self._tasks.put((batch_id, batch, 0))
+    def submit(self, index: int, text: str) -> None:
+        self._tasks.put((index, text, 0))
 
     def close(self) -> None:
         for _ in self._threads:
@@ -123,30 +122,23 @@ class LLMBatchWorkerPool:
             if task is None:
                 self._tasks.task_done()
                 break
-            batch_id, batch, attempt = task
+            index, text, attempt = task
             try:
-                prompts = [_build_prompt(text) for _, text in batch]
-                response = client.completions.create(
+                response = client.chat.completions.create(
                     model=self._model,
-                    prompt=prompts,
+                    messages=_build_messages(text),
                     temperature=OPENAI_TEMPERATURE,
                     max_tokens=OPENAI_MAX_TOKENS,
-                    stop=["\nEnglish:"],
                 )
-                translations = ["" for _ in prompts]
-                for choice in response.choices:
-                    index = getattr(choice, "index", None)
-                    if index is None or index < 0 or index >= len(translations):
-                        continue
-                    text = choice.text or ""
-                    translations[index] = text.lstrip("\n ")
-                self._results.put((batch_id, batch, translations, None))
+                content = response.choices[0].message.content
+                translated = content if content is not None else ""
+                self._results.put((index, text, translated, None))
             except Exception as exc:
                 if attempt < self._max_retries:
                     time.sleep(0.5 * (attempt + 1))
-                    self._tasks.put((batch_id, batch, attempt + 1))
+                    self._tasks.put((index, text, attempt + 1))
                 else:
-                    self._results.put((batch_id, batch, ["" for _ in batch], exc))
+                    self._results.put((index, text, "", exc))
             finally:
                 self._tasks.task_done()
 
@@ -373,17 +365,14 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--model",
         default=None,
-        help="Override model name for translation.",
+        help="Override model name.",
     )
     return parser.parse_args(argv)
 
 
 def main(argv: Sequence[str] | None = None) -> None:
     args = _parse_args(argv)
-    if args.model:
-        model = args.model
-    else:
-        model = OPENAI_MODEL
+    model = args.model or OPENAI_MODEL
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     progress = _load_progress(PROGRESS_PATH)
     existing_rows = _count_existing_rows(OUTPUT_DIR)
@@ -418,9 +407,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         existing_rows,
     )
     processed = resume_from
-    batch_size = max(1, BATCH_SIZE)
-    max_in_flight = max(1, len(BASE_URLS))
-    pool = LLMBatchWorkerPool(
+    max_in_flight = max(1, TARGET_IN_FLIGHT)
+    pool = LLMWorkerPool(
         BASE_URLS,
         API_KEY,
         model=model,
@@ -434,8 +422,6 @@ def main(argv: Sequence[str] | None = None) -> None:
     progress_bar = None
     last_written = existing_rows
     skipped_errors = 0
-    batch: list[tuple[int, str]] = []
-    batch_id = 0
     if tqdm is not None:
         progress_bar = tqdm(
             total=max_samples,
@@ -479,48 +465,21 @@ def main(argv: Sequence[str] | None = None) -> None:
                 if max_samples is not None and progress_bar is not None:
                     progress_bar.total = max_samples
                     progress_bar.refresh()
-
-            while (
-                in_flight < max_in_flight
-                and (max_samples is None or submitted < max_samples)
-                and not dataset_exhausted
-            ):
-                while (
-                    not dataset_exhausted
-                    and (max_samples is None or submitted < max_samples)
-                    and len(batch) < batch_size
-                ):
-                    try:
-                        sample = next(dataset_iter)
-                    except StopIteration:
-                        dataset_exhausted = True
-                        if max_samples is not None:
-                            submitted = max_samples
-                        break
-                    text = sample.get("text", "")
-                    if not text:
-                        pending[submitted] = ("", "")
-                    else:
-                        batch.append((submitted, text))
-                    submitted += 1
-
-                if batch:
-                    pool.submit(batch_id, batch)
-                    in_flight += 1
-                    batch_id += 1
-                    batch = []
-                if dataset_exhausted:
+            while (max_samples is None or submitted < max_samples) and in_flight < max_in_flight:
+                try:
+                    sample = next(dataset_iter)
+                except StopIteration:
+                    dataset_exhausted = True
+                    if max_samples is not None:
+                        submitted = max_samples
                     break
-
-            if (
-                batch
-                and in_flight < max_in_flight
-                and (dataset_exhausted or (max_samples is not None and submitted >= max_samples))
-            ):
-                pool.submit(batch_id, batch)
-                in_flight += 1
-                batch_id += 1
-                batch = []
+                text = sample.get("text", "")
+                if not text:
+                    pending[submitted] = ("", "")
+                else:
+                    pool.submit(submitted, text)
+                    in_flight += 1
+                submitted += 1
 
             wrote_any = False
             while expected_index in pending:
@@ -552,21 +511,18 @@ def main(argv: Sequence[str] | None = None) -> None:
 
             if max_samples is not None and expected_index >= max_samples:
                 break
-            if in_flight == 0 and (dataset_exhausted or (max_samples is not None and submitted >= max_samples)):
-                if not pending and not batch:
-                    break
             if wrote_any:
                 continue
-            if in_flight == 0:
-                continue
+            if in_flight == 0 and (dataset_exhausted or (max_samples is not None and submitted >= max_samples)):
+                break
 
-            _batch_id, result_batch, translations, error = pool.results.get()
+            index, text_en, text_ja, error = pool.results.get()
             in_flight -= 1
             if error is not None:
-                skipped_errors += len(result_batch)
-                print(f"skip batch start_index={result_batch[0][0]} error={error}")
-                translations = ["" for _ in result_batch]
-            for (index, text_en), text_ja in zip(result_batch, translations):
+                skipped_errors += 1
+                print(f"skip index={index} error={error}")
+                pending[index] = ("", "")
+            else:
                 pending[index] = (text_en, text_ja)
     finally:
         pool.close()
