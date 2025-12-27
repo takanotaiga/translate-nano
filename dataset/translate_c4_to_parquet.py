@@ -51,6 +51,7 @@ OPENAI_API_BASE_URL = os.environ.get("OPENAI_API_BASE_URL", "").strip()
 OPENAI_RATE_TIER = os.environ.get("OPENAI_RATE_TIER", "1")
 OPENAI_RPM = os.environ.get("OPENAI_RPM", "").strip()
 OPENAI_TPM = os.environ.get("OPENAI_TPM", "").strip()
+OPENAI_API_IN_FLIGHT = int(os.environ.get("OPENAI_API_IN_FLIGHT", "4"))
 
 OPENAI_RATE_LIMITS = {
     "1": {"rpm": 500, "tpm": 200_000},
@@ -171,9 +172,10 @@ class LLMWorkerPool:
         rate_limiter: RateLimiter | None = None,
         max_retries: int = 2,
         worker_count: int | None = None,
+        results_queue: queue.Queue[tuple[int, str, str, Exception | None]] | None = None,
     ) -> None:
         self._tasks: queue.Queue[tuple[int, str, int] | None] = queue.Queue()
-        self._results: queue.Queue[tuple[int, str, str, Exception | None]] = queue.Queue()
+        self._results = results_queue or queue.Queue()
         self._threads: list[threading.Thread] = []
         self._max_retries = max_retries
         if backend not in ("gpt-oss", "openai-api"):
@@ -257,6 +259,27 @@ class LLMWorkerPool:
                     self._results.put((index, text, "", exc))
             finally:
                 self._tasks.task_done()
+
+
+class _PoolState:
+    def __init__(self, name: str, pool: LLMWorkerPool, max_in_flight: int) -> None:
+        self.name = name
+        self.pool = pool
+        self.max_in_flight = max(1, max_in_flight)
+        self.in_flight = 0
+
+
+def _pick_pool(
+    pools: list[_PoolState],
+    start_index: int,
+) -> tuple[_PoolState | None, int]:
+    if not pools:
+        return None, start_index
+    for offset in range(len(pools)):
+        pool = pools[(start_index + offset) % len(pools)]
+        if pool.in_flight < pool.max_in_flight:
+            return pool, start_index + offset + 1
+    return None, start_index
 
 
 def _normalize_text(value: str | None) -> str:
@@ -480,7 +503,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Translate C4 data to parquet.")
     parser.add_argument(
         "--backend",
-        choices=("gpt-oss", "openai-api"),
+        choices=("gpt-oss", "openai-api", "hybrid"),
         default=os.environ.get("TRANSLATION_BACKEND", "gpt-oss"),
         help="Translation backend to use.",
     )
@@ -510,34 +533,37 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _build_openai_rate_limiter(args: argparse.Namespace) -> RateLimiter:
+    limits = OPENAI_RATE_LIMITS.get(str(args.rate_tier), OPENAI_RATE_LIMITS["1"])
+    rpm = args.rpm
+    tpm = args.tpm
+    if rpm is None and OPENAI_RPM:
+        try:
+            rpm = int(OPENAI_RPM)
+        except ValueError:
+            rpm = None
+    if tpm is None and OPENAI_TPM:
+        try:
+            tpm = int(OPENAI_TPM)
+        except ValueError:
+            tpm = None
+    return RateLimiter(rpm or limits["rpm"], tpm or limits["tpm"])
+
+
 def main(argv: Sequence[str] | None = None) -> None:
     args = _parse_args(argv)
     backend = args.backend
+    gpt_model = GPT_OSS_MODEL
+    openai_model = OPENAI_API_MODEL
     if args.model:
-        model = args.model
-    elif backend == "openai-api":
-        model = OPENAI_API_MODEL
+        gpt_model = args.model
+        openai_model = args.model
+    if backend in ("openai-api", "hybrid"):
+        openai_base_urls = [OPENAI_API_BASE_URL] if OPENAI_API_BASE_URL else [""]
+        openai_rate_limiter = _build_openai_rate_limiter(args)
     else:
-        model = GPT_OSS_MODEL
-    if backend == "openai-api":
-        base_urls = [OPENAI_API_BASE_URL] if OPENAI_API_BASE_URL else [""]
-        limits = OPENAI_RATE_LIMITS.get(str(args.rate_tier), OPENAI_RATE_LIMITS["1"])
-        rpm = args.rpm
-        tpm = args.tpm
-        if rpm is None and OPENAI_RPM:
-            try:
-                rpm = int(OPENAI_RPM)
-            except ValueError:
-                rpm = None
-        if tpm is None and OPENAI_TPM:
-            try:
-                tpm = int(OPENAI_TPM)
-            except ValueError:
-                tpm = None
-        rate_limiter = RateLimiter(rpm or limits["rpm"], tpm or limits["tpm"])
-    else:
-        base_urls = BASE_URLS
-        rate_limiter = None
+        openai_base_urls = []
+        openai_rate_limiter = None
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     progress = _load_progress(PROGRESS_PATH)
     existing_rows = _count_existing_rows(OUTPUT_DIR)
@@ -573,22 +599,59 @@ def main(argv: Sequence[str] | None = None) -> None:
     )
     processed = resume_from
     max_in_flight = max(1, TARGET_IN_FLIGHT)
-    pool = LLMWorkerPool(
-        base_urls,
-        API_KEY,
-        backend=backend,
-        model=model,
-        rate_limiter=rate_limiter,
-        worker_count=max_in_flight,
-    )
+    results_queue: queue.Queue[tuple[int, str, str, Exception | None]] = queue.Queue()
+    pools: list[_PoolState] = []
+    if backend == "gpt-oss":
+        pool = LLMWorkerPool(
+            BASE_URLS,
+            API_KEY,
+            backend="gpt-oss",
+            model=gpt_model,
+            worker_count=max_in_flight,
+            results_queue=results_queue,
+        )
+        pools.append(_PoolState("gpt-oss", pool, max_in_flight))
+    elif backend == "openai-api":
+        pool = LLMWorkerPool(
+            openai_base_urls,
+            API_KEY,
+            backend="openai-api",
+            model=openai_model,
+            rate_limiter=openai_rate_limiter,
+            worker_count=max_in_flight,
+            results_queue=results_queue,
+        )
+        pools.append(_PoolState("openai-api", pool, max_in_flight))
+    else:
+        gpt_pool = LLMWorkerPool(
+            BASE_URLS,
+            API_KEY,
+            backend="gpt-oss",
+            model=gpt_model,
+            worker_count=max_in_flight,
+            results_queue=results_queue,
+        )
+        openai_in_flight = max(1, OPENAI_API_IN_FLIGHT)
+        openai_pool = LLMWorkerPool(
+            openai_base_urls,
+            API_KEY,
+            backend="openai-api",
+            model=openai_model,
+            rate_limiter=openai_rate_limiter,
+            worker_count=openai_in_flight,
+            results_queue=results_queue,
+        )
+        pools.append(_PoolState("gpt-oss", gpt_pool, max_in_flight))
+        pools.append(_PoolState("openai-api", openai_pool, openai_in_flight))
     pending: dict[int, tuple[str, str]] = {}
-    in_flight = 0
+    in_flight_by_index: dict[int, _PoolState] = {}
     submitted = resume_from
     expected_index = resume_from
     dataset_iter = iter(dataset["train"])
     progress_bar = None
     last_written = existing_rows
     skipped_errors = 0
+    next_pool_index = 0
     if tqdm is not None:
         progress_bar = tqdm(
             total=max_samples,
@@ -632,7 +695,10 @@ def main(argv: Sequence[str] | None = None) -> None:
                 if max_samples is not None and progress_bar is not None:
                     progress_bar.total = max_samples
                     progress_bar.refresh()
-            while (max_samples is None or submitted < max_samples) and in_flight < max_in_flight:
+            while max_samples is None or submitted < max_samples:
+                pool_state, next_pool_index = _pick_pool(pools, next_pool_index)
+                if pool_state is None:
+                    break
                 try:
                     sample = next(dataset_iter)
                 except StopIteration:
@@ -644,8 +710,9 @@ def main(argv: Sequence[str] | None = None) -> None:
                 if not text:
                     pending[submitted] = ("", "")
                 else:
-                    pool.submit(submitted, text)
-                    in_flight += 1
+                    pool_state.pool.submit(submitted, text)
+                    pool_state.in_flight += 1
+                    in_flight_by_index[submitted] = pool_state
                 submitted += 1
 
             wrote_any = False
@@ -662,9 +729,10 @@ def main(argv: Sequence[str] | None = None) -> None:
                     )
                     last_written = writer.written_rows
                 if progress_bar is not None:
+                    total_in_flight = sum(pool.in_flight for pool in pools)
                     progress_bar.update(1)
                     progress_bar.set_postfix(
-                        in_flight=in_flight,
+                        in_flight=total_in_flight,
                         pending=len(pending),
                         buffered=writer.buffered_rows,
                     )
@@ -680,11 +748,16 @@ def main(argv: Sequence[str] | None = None) -> None:
                 break
             if wrote_any:
                 continue
-            if in_flight == 0 and (dataset_exhausted or (max_samples is not None and submitted >= max_samples)):
+            total_in_flight = sum(pool.in_flight for pool in pools)
+            if total_in_flight == 0 and (
+                dataset_exhausted or (max_samples is not None and submitted >= max_samples)
+            ):
                 break
 
-            index, text_en, text_ja, error = pool.results.get()
-            in_flight -= 1
+            index, text_en, text_ja, error = results_queue.get()
+            pool_state = in_flight_by_index.pop(index, None)
+            if pool_state is not None:
+                pool_state.in_flight = max(0, pool_state.in_flight - 1)
             if error is not None:
                 skipped_errors += 1
                 print(f"skip index={index} error={error}")
@@ -692,7 +765,8 @@ def main(argv: Sequence[str] | None = None) -> None:
             else:
                 pending[index] = (text_en, text_ja)
     finally:
-        pool.close()
+        for pool_state in pools:
+            pool_state.pool.close()
 
     final_flushed = writer.flush()
     if final_flushed > 0 or last_written != writer.written_rows:
