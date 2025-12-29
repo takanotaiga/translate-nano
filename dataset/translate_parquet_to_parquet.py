@@ -1,13 +1,19 @@
 import argparse
+from collections import deque
 import glob
 import json
 import os
 import queue
+import re
 import threading
 import time
 from typing import Iterable, Sequence
 
 from openai import OpenAI
+try:
+    from openai import RateLimitError
+except Exception:  # pragma: no cover - optional import
+    RateLimitError = None
 import pyarrow as pa
 import pyarrow.parquet as pq
 try:
@@ -25,13 +31,14 @@ DEFAULT_OUTPUT_PREFIX = "c4-train-ja-filtered"
 DEFAULT_MAX_SAMPLES = -1
 DEFAULT_READ_BATCH_SIZE = 1024
 
-TARGET_IN_FLIGHT = 80
+TARGET_IN_FLIGHT = 4
 WRITE_EVERY_ROWS = 1000
 
 GPT_OSS_MODEL = os.environ.get(
     "GPT_OSS_MODEL",
     os.environ.get("OPENAI_MODEL", "openai/gpt-oss-20b"),
 )
+OPENAI_API_MODEL = os.environ.get("OPENAI_API_MODEL", "gpt-5-nano")
 OPENAI_TEMPERATURE = float(os.environ.get("OPENAI_TEMPERATURE", "0.3"))
 OPENAI_MAX_TOKENS = int(os.environ.get("OPENAI_MAX_TOKENS", "4096"))
 API_KEY = os.environ.get("OPENAI_API_KEY", "dummy")
@@ -43,6 +50,19 @@ BASE_URLS = [
 ]
 if not BASE_URLS:
     BASE_URLS = [BASE_URL]
+OPENAI_API_BASE_URL = os.environ.get("OPENAI_API_BASE_URL", "").strip()
+OPENAI_RATE_TIER = os.environ.get("OPENAI_RATE_TIER", "1")
+OPENAI_RPM = os.environ.get("OPENAI_RPM", "").strip()
+OPENAI_TPM = os.environ.get("OPENAI_TPM", "").strip()
+OPENAI_API_IN_FLIGHT = int(os.environ.get("OPENAI_API_IN_FLIGHT", "4"))
+
+OPENAI_RATE_LIMITS = {
+    "1": {"rpm": 500, "tpm": 200_000},
+    "2": {"rpm": 5_000, "tpm": 2_000_000},
+    "3": {"rpm": 5_000, "tpm": 4_000_000},
+    "4": {"rpm": 10_000, "tpm": 10_000_000},
+    "5": {"rpm": 30_000, "tpm": 180_000_000},
+}
 
 
 def _build_messages(user_input: str) -> list[dict[str, str]]:
@@ -79,12 +99,78 @@ def _build_messages(user_input: str) -> list[dict[str, str]]:
     ]
 
 
+def _estimate_text_tokens(text: str) -> int:
+    if not text:
+        return 0
+    return max(1, len(text.encode("utf-8")) // 3)
+
+
+_BASE_PROMPT_TEXT = "\n".join(msg["content"] for msg in _build_messages(""))
+_BASE_PROMPT_TOKENS = _estimate_text_tokens(_BASE_PROMPT_TEXT)
+
+
+def _estimate_request_tokens(user_input: str, max_completion_tokens: int) -> int:
+    prompt_tokens = _BASE_PROMPT_TOKENS + _estimate_text_tokens(user_input)
+    return max(1, prompt_tokens + max_completion_tokens)
+
+
+def _parse_retry_after_seconds(message: str) -> float | None:
+    match_ms = re.search(r"try again in (\d+)ms", message, re.IGNORECASE)
+    if match_ms:
+        return max(0.0, float(match_ms.group(1)) / 1000.0)
+    match_s = re.search(r"try again in ([0-9.]+)s", message, re.IGNORECASE)
+    if match_s:
+        return max(0.0, float(match_s.group(1)))
+    return None
+
+
+class RateLimiter:
+    def __init__(self, rpm: int, tpm: int) -> None:
+        self._rpm = max(1, rpm)
+        self._tpm = max(1, tpm)
+        self._lock = threading.Lock()
+        self._request_times: deque[float] = deque()
+        self._token_events: deque[tuple[float, int]] = deque()
+
+    def acquire(self, tokens: int) -> None:
+        tokens = min(max(1, tokens), self._tpm)
+        while True:
+            with self._lock:
+                now = time.time()
+                while self._request_times and now - self._request_times[0] >= 60:
+                    self._request_times.popleft()
+                while self._token_events and now - self._token_events[0][0] >= 60:
+                    self._token_events.popleft()
+                req_count = len(self._request_times)
+                token_sum = sum(item[1] for item in self._token_events)
+                if req_count < self._rpm and token_sum + tokens <= self._tpm:
+                    self._request_times.append(now)
+                    self._token_events.append((now, tokens))
+                    return
+                wait_seconds = 0.05
+                if req_count >= self._rpm and self._request_times:
+                    wait_seconds = max(wait_seconds, 60 - (now - self._request_times[0]))
+                if token_sum + tokens > self._tpm and self._token_events:
+                    excess = token_sum + tokens - self._tpm
+                    cumulative = 0
+                    wait_until = self._token_events[-1][0] + 60
+                    for ts, tok in self._token_events:
+                        cumulative += tok
+                        if cumulative >= excess:
+                            wait_until = ts + 60
+                            break
+                    wait_seconds = max(wait_seconds, wait_until - now)
+            time.sleep(wait_seconds)
+
+
 class LLMWorkerPool:
     def __init__(
         self,
         base_urls: list[str],
         api_key: str,
+        backend: str,
         model: str,
+        rate_limiter: RateLimiter | None = None,
         max_retries: int = 2,
         worker_count: int | None = None,
         results_queue: queue.Queue[tuple[int, str, str, Exception | None]] | None = None,
@@ -93,7 +179,11 @@ class LLMWorkerPool:
         self._results = results_queue or queue.Queue()
         self._threads: list[threading.Thread] = []
         self._max_retries = max_retries
+        if backend not in ("gpt-oss", "openai-api"):
+            raise ValueError(f"unsupported backend: {backend}")
+        self._backend = backend
         self._model = model
+        self._rate_limiter = rate_limiter
         if not base_urls:
             raise ValueError("base_urls must not be empty")
         total_workers = worker_count or len(base_urls)
@@ -132,17 +222,38 @@ class LLMWorkerPool:
                 break
             index, text, attempt = task
             try:
-                response = client.chat.completions.create(
-                    model=self._model,
-                    messages=_build_messages(text),
-                    temperature=OPENAI_TEMPERATURE,
-                    max_tokens=OPENAI_MAX_TOKENS,
-                )
+                if self._backend == "openai-api":
+                    if self._rate_limiter is not None:
+                        estimated_tokens = _estimate_request_tokens(text, OPENAI_MAX_TOKENS)
+                        self._rate_limiter.acquire(estimated_tokens)
+                    response = client.chat.completions.create(
+                        model=self._model,
+                        messages=_build_messages(text),
+                        max_completion_tokens=OPENAI_MAX_TOKENS,
+                    )
+                else:
+                    response = client.chat.completions.create(
+                        model=self._model,
+                        messages=_build_messages(text),
+                        temperature=OPENAI_TEMPERATURE,
+                        max_tokens=OPENAI_MAX_TOKENS,
+                    )
                 content = response.choices[0].message.content
                 translated = content if content is not None else ""
                 self._results.put((index, text, translated, None))
             except Exception as exc:
-                if attempt < self._max_retries:
+                is_rate_limit = False
+                if RateLimitError is not None and isinstance(exc, RateLimitError):
+                    is_rate_limit = True
+                else:
+                    message = str(exc)
+                    if "rate limit" in message.lower() or "429" in message:
+                        is_rate_limit = True
+                if self._backend == "openai-api" and is_rate_limit:
+                    retry_after = _parse_retry_after_seconds(str(exc)) or 1.0
+                    time.sleep(retry_after)
+                    self._tasks.put((index, text, attempt))
+                elif attempt < self._max_retries:
                     time.sleep(0.5 * (attempt + 1))
                     self._tasks.put((index, text, attempt + 1))
                 else:
@@ -411,6 +522,30 @@ def _iter_parquet_texts(
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Translate parquet data to parquet.")
     parser.add_argument(
+        "--backend",
+        choices=("gpt-oss", "openai-api", "hybrid"),
+        default=os.environ.get("TRANSLATION_BACKEND", "gpt-oss"),
+        help="Translation backend to use.",
+    )
+    parser.add_argument(
+        "--rate-tier",
+        choices=tuple(OPENAI_RATE_LIMITS.keys()),
+        default=OPENAI_RATE_TIER,
+        help="OpenAI rate tier (openai-api only).",
+    )
+    parser.add_argument(
+        "--rpm",
+        type=int,
+        default=None,
+        help="Override requests per minute (openai-api only).",
+    )
+    parser.add_argument(
+        "--tpm",
+        type=int,
+        default=None,
+        help="Override tokens per minute (openai-api only).",
+    )
+    parser.add_argument(
         "--data-files",
         default=DEFAULT_DATA_FILES,
         help="Glob pattern, file, or directory for input parquet files.",
@@ -460,11 +595,37 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _build_openai_rate_limiter(args: argparse.Namespace) -> RateLimiter:
+    limits = OPENAI_RATE_LIMITS.get(str(args.rate_tier), OPENAI_RATE_LIMITS["1"])
+    rpm = args.rpm
+    tpm = args.tpm
+    if rpm is None and OPENAI_RPM:
+        try:
+            rpm = int(OPENAI_RPM)
+        except ValueError:
+            rpm = None
+    if tpm is None and OPENAI_TPM:
+        try:
+            tpm = int(OPENAI_TPM)
+        except ValueError:
+            tpm = None
+    return RateLimiter(rpm or limits["rpm"], tpm or limits["tpm"])
+
+
 def main(argv: Sequence[str] | None = None) -> None:
     args = _parse_args(argv)
+    backend = args.backend
     gpt_model = GPT_OSS_MODEL
+    openai_model = OPENAI_API_MODEL
     if args.model:
         gpt_model = args.model
+        openai_model = args.model
+    if backend in ("openai-api", "hybrid"):
+        openai_base_urls = [OPENAI_API_BASE_URL] if OPENAI_API_BASE_URL else [""]
+        openai_rate_limiter = _build_openai_rate_limiter(args)
+    else:
+        openai_base_urls = []
+        openai_rate_limiter = None
 
     data_files_pattern = args.data_files
     paths = _expand_data_files(data_files_pattern)
@@ -512,14 +673,48 @@ def main(argv: Sequence[str] | None = None) -> None:
     max_in_flight = max(1, TARGET_IN_FLIGHT)
     results_queue: queue.Queue[tuple[int, str, str, Exception | None]] = queue.Queue()
     pools: list[_PoolState] = []
-    pool = LLMWorkerPool(
-        BASE_URLS,
-        API_KEY,
-        model=gpt_model,
-        worker_count=max_in_flight,
-        results_queue=results_queue,
-    )
-    pools.append(_PoolState("gpt-oss", pool, max_in_flight))
+    if backend == "gpt-oss":
+        pool = LLMWorkerPool(
+            BASE_URLS,
+            API_KEY,
+            backend="gpt-oss",
+            model=gpt_model,
+            worker_count=max_in_flight,
+            results_queue=results_queue,
+        )
+        pools.append(_PoolState("gpt-oss", pool, max_in_flight))
+    elif backend == "openai-api":
+        pool = LLMWorkerPool(
+            openai_base_urls,
+            API_KEY,
+            backend="openai-api",
+            model=openai_model,
+            rate_limiter=openai_rate_limiter,
+            worker_count=max_in_flight,
+            results_queue=results_queue,
+        )
+        pools.append(_PoolState("openai-api", pool, max_in_flight))
+    else:
+        gpt_pool = LLMWorkerPool(
+            BASE_URLS,
+            API_KEY,
+            backend="gpt-oss",
+            model=gpt_model,
+            worker_count=max_in_flight,
+            results_queue=results_queue,
+        )
+        openai_in_flight = max(1, OPENAI_API_IN_FLIGHT)
+        openai_pool = LLMWorkerPool(
+            openai_base_urls,
+            API_KEY,
+            backend="openai-api",
+            model=openai_model,
+            rate_limiter=openai_rate_limiter,
+            worker_count=openai_in_flight,
+            results_queue=results_queue,
+        )
+        pools.append(_PoolState("gpt-oss", gpt_pool, max_in_flight))
+        pools.append(_PoolState("openai-api", openai_pool, openai_in_flight))
 
     pending: dict[int, tuple[str, str]] = {}
     in_flight_by_index: dict[int, _PoolState] = {}
