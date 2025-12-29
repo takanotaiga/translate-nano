@@ -32,7 +32,7 @@ uv run dataset/translate_parquet_to_parquet.py --data-files "./c4-en-filtered-pa
 uv run ./dataset/c4-en-64_download.py
 ```
 
-### OpenAI API backend
+### gpt-oss backend
 
 ```bash
 uv run dataset/translate_parquet_to_parquet.py \
