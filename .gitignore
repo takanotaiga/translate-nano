@@ -12,3 +12,6 @@ wheels/
 # dataset
 *.parquet
 *.zip
+
+# log
+logs/
