@@ -1,5 +1,13 @@
 # Translate Nano
 
+## Env Setup
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+git clone https://github.com/takanotaiga/translate-nano.git
+cd translate-nano
+uv sync
+```
+
 ## Run translation (parquet -> parquet)
 
 ```bash
